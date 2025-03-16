@@ -1,4 +1,3 @@
 # morahman
 First Git Project Update
-<br>
-Project decided
+<br> Project decided
