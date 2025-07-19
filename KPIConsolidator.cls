@@ -1,600 +1,746 @@
-VERSION 1.0 CLASS
-BEGIN
-  MultiUse = -1  'True
-END
-Attribute VB_Name = "KPIConsolidator"
-Attribute VB_GlobalNameSpace = False
-Attribute VB_Creatable = False
-Attribute VB_PredeclaredId = False
-Attribute VB_Exposed = False
-' KPIConsolidator.cls
 Option Explicit
+
+' KPIConsolidator.cls - Optimized and Revamped
+' Dependencies: Microsoft Scripting Runtime
+' Assumes k_config and wsRef set externally
+
+Private Const MODULE_NAME As String = "KPIConsolidator"
+Private Const DICTIONARY_COMPARE_MODE As Integer = vbTextCompare
+Private Const MAX_BRANCH_CODE_LENGTH As Integer = 6
+Private Const MIN_BRANCH_CODE_LENGTH As Integer = 6
+
+' Enhanced types for better structure
 Private Type THeaderInfo
-    row As Long
-    branchCodeCol As Long
+    Row As Long
+    BranchCodeCol As Long
+    LastRow As Long
+    LastCol As Long
 End Type
 
-Private Type TKPIData
-    Headers As Scripting.Dictionary
-    data As Scripting.Dictionary
-    CommonHeaders As Scripting.Dictionary
-    LabelMaps As Scripting.Dictionary
-    DateProcessor As DateProcessor
+Private Type TFileInfo
+    Pattern As String
+    LabelMap As String
+    Processed As Boolean
 End Type
 
-Private Type TFilePatterns
-    Patterns() As String
+Private Type TProcessingStats
+    FilesProcessed As Long
+    RecordsProcessed As Long
+    ErrorCount As Long
+    StartTime As Date
+    EndTime As Date
 End Type
 
-Private this As TKPIData
-Private FilePatterns As TFilePatterns
+' Internal state with improved organization
+Private m_Headers As Scripting.Dictionary
+Private m_Data As Scripting.Dictionary
+Private m_CommonHeaders As Scripting.Dictionary
+Private m_LabelMaps As Scripting.Dictionary
+Private m_FilePatterns() As TFileInfo
+Private m_ProcessedFiles As Scripting.Dictionary
+Private m_ProcessingStats As TProcessingStats
+Private m_ErrorLog As String
+
+' Performance optimization flags
+Private m_ScreenUpdating As Boolean
+Private m_Calculation As XlCalculation
+Private m_EnableEvents As Boolean
+
+' --- Class Lifecycle ---
 
 Private Sub Class_Initialize()
-    ' Initialize dictionaries
-    Set this.Headers = New Scripting.Dictionary
-    Set this.data = New Scripting.Dictionary
-    Set this.CommonHeaders = New Scripting.Dictionary
-    Set this.LabelMaps = New Scripting.Dictionary
-    
-    ' Set file patterns to match
-    ReDim FilePatterns.Patterns(3)
-    FilePatterns.Patterns(0) = "*SMEAD-002*.xlsx"
-    FilePatterns.Patterns(1) = "*SMEAD-009*.xlsx"
-    FilePatterns.Patterns(2) = "*SMEAD-001*.xlsx"
-    FilePatterns.Patterns(3) = "*PSFID-011*.xlsx"
-End Sub
-Public Sub LoadCommonHeaders()
-    Dim headerRange As Range
-    Set headerRange = wsRefer.Range("CommonHeaders")
-    
-    Dim header As Range
-    For Each header In headerRange.Columns(1).Cells
-        If Not this.CommonHeaders.Exists(header.value) Then
-            this.CommonHeaders.Add header.value, header.offset(0, 1).value
-        End If
-    Next header
-End Sub
-Public Sub LoadLabelMaps()
-    Dim headerRange As Range
-    Set headerRange = wsRefer.Range("LabelMap")
-    
-    Dim header As Range
-    For Each header In headerRange.Columns(1).Cells
-        If Not this.LabelMaps.Exists(header.value) Then
-            this.LabelMaps.Add header.value, header.offset(0, 1).value
-        End If
-    Next header
-End Sub
-
-Public Sub ProcessFiles(ByVal FilePath As String, ByVal dateVal As String)
-    ' Complete reset of dictionaries
-    Set this.Headers = New Scripting.Dictionary
-    Set this.data = New Scripting.Dictionary
-    ' Don't recreate CommonHeaders as it's loaded separately
-    
-    Dim fName As String
-    Dim filesProcessed As Long
-    
-    fName = Dir(FilePath & dateVal & " *.xlsx")
-    
-    Do While fName <> ""
-        If MatchesPattern(fName) Then
-            On Error Resume Next
-            ProcessWorkbook FilePath & fName
-            If Err.Number <> 0 Then
-                Debug.Print "Error processing file " & fName & ": " & Err.Description
-                Err.Clear
-            End If
-            On Error GoTo 0
-            filesProcessed = filesProcessed + 1
-        End If
-        fName = Dir
-    Loop
-    
-    If filesProcessed = 0 Then
-        Err.Raise 1000, "ProcessFiles", "No matching files found"
-    End If
-End Sub
-Private Function MatchesPattern(ByVal fileName As String) As Boolean
-    Dim i As Long
-    For i = 0 To UBound(FilePatterns.Patterns)
-        If fileName Like FilePatterns.Patterns(i) Then
-            MatchesPattern = True
-            Exit Function
-        End If
-    Next i
-End Function
-
-Private Sub ProcessWorkbook(ByVal FilePath As String)
-    Dim wb As Workbook
-    Set wb = Workbooks.Open(FilePath, ReadOnly:=True)
-    
-    On Error GoTo CleanUp
-    ProcessWorksheet wb.Sheets(1)
-    
-CleanUp:
-    wb.Close False
-    If Err.Number <> 0 Then Err.Raise Err.Number
-End Sub
-Private Function FindHeaderInfo(ByVal ws As Worksheet, ByVal searchTerms As Variant) As THeaderInfo
-    Dim rng As Range
-    Dim term As Variant
-    
-    ' Initialize the return value
-    FindHeaderInfo.row = 0
-    FindHeaderInfo.branchCodeCol = 0
-    
-    ' Loop through each search term
-    For Each term In searchTerms.Keys
-        Set rng = ws.UsedRange.Find(term, LookIn:=xlValues, Lookat:=xlWhole)
-        
-        If Not rng Is Nothing Then
-            FindHeaderInfo.row = rng.row
-            FindHeaderInfo.branchCodeCol = rng.Column
-            Exit For ' Exit the loop once a match is found
-        End If
-    Next term
-End Function
-Private Sub ProcessData(ByRef dataArray As Variant, ByVal PKeycol As Long)
-    Dim i As Long, j As Long
-    Dim BranchCode As String, HeaderName As String, newHeader As String
-    Dim currentFilename As String
-    Dim divisor As Double
-    
-    ' Get current filename to check if it's PSFID-011
-    currentFilename = ActiveWorkbook.name
-    
-    ' Set the divisor based on the filename
-    If InStr(currentFilename, "PSFID-011") > 0 Then
-        divisor = 100000 ' Convert Rs. to Lakhs
-    Else
-        divisor = 1 ' No conversion needed
-    End If
-    
-    ' Calculate relative position in array for branch code column
-    For i = 2 To UBound(dataArray, 1)
-        BranchCode = Left(dataArray(i, PKeycol), 6)
-        
-        If Not this.data.Exists(BranchCode) Then
-            Set this.data(BranchCode) = New Scripting.Dictionary
-        End If
-        
-        For j = 1 To UBound(dataArray, 2)
-            HeaderName = Trim(UCase(dataArray(1, j)))
-            
-            If this.LabelMaps.Exists(HeaderName) Then
-                newHeader = this.LabelMaps(HeaderName)
-'                newHeader = this.CommonHeaders(HeaderName)
-            Else
-                newHeader = HeaderName
-            End If
-            
-            If Not this.Headers.Exists(newHeader) Then
-                this.Headers(newHeader) = this.Headers.Count + 1
-            End If
-            
-            ' Apply conversion if needed, skipping the branch code and identifier columns
-            If IsNumeric(dataArray(i, j)) And j <> PKeycol Then  'And Not (HeaderName Like "*CODE*" Or HeaderName Like "*ID*" Or HeaderName = "BRANCH CODE")
-                this.data(BranchCode)(newHeader) = dataArray(i, j) / divisor
-            Else
-                this.data(BranchCode)(newHeader) = dataArray(i, j)
-            End If
-        Next j
-    Next i
-End Sub
-Public Sub GenerateReport(ByVal FilePath As String, ByVal dateVal As String)
-    Dim wb As Workbook
-    Set wb = Workbooks.Add
-    
-    With wb.Sheets(1)
-        .name = "KPI"
-        WriteData .Cells, dateVal
-        FormatWorksheet wb.Sheets(1)
-    End With
-    
-        wb.SaveAs FilePath & dateVal & "KPI.xlsx"
-        wb.Close False
-End Sub
-Private Sub WriteData(ByVal startCell As Range, ByVal dateVal As String)
-    ' Write headers
-    startCell.Cells(1, 1).value = "REPORT DATE"
-'    startCell.Cells(1, 2).value = "BRANCH CODE"
-    
-    Dim Col As Long
-    Col = 2
-    
-    ' Keep track of headers and their column positions
-    Dim writtenHeaders As New Scripting.Dictionary
-    
-    ' Write common headers first
-    Dim key As Variant
-    For Each key In this.CommonHeaders.Keys
-        Dim headervalue As String
-        headervalue = this.CommonHeaders(key)
-        
-        If this.Headers.Exists(headervalue) And Not writtenHeaders.Exists(headervalue) Then
-            startCell.Cells(1, Col).value = headervalue
-            writtenHeaders.Add headervalue, Col
-            Col = Col + 1
-        End If
-    Next key
-    
-    ' Write remaining headers
-    For Each key In this.Headers.Keys
-        If Not writtenHeaders.Exists(key) Then
-            startCell.Cells(1, Col).value = key
-            writtenHeaders.Add key, Col
-            Col = Col + 1
-        End If
-    Next key
-    
-    ' Write data using the same column mapping from writtenHeaders
-    Dim row As Long
-    row = 2
-    Dim branch As Variant
-    
-    For Each branch In this.data.Keys
-        ' Write date and branch
-        startCell.Cells(row, 1).value = dateVal
-        startCell.Cells(row, 2).NumberFormat = "@"
-'        startCell.Cells(row, 2).value = branch
-        
-        ' Write all data using column positions from writtenHeaders
-        Dim dataKey As Variant
-        For Each dataKey In this.data(branch).Keys
-            If writtenHeaders.Exists(dataKey) Then
-                startCell.Cells(row, writtenHeaders(dataKey)).value = this.data(branch)(dataKey)
-            End If
-        Next dataKey
-        
-        row = row + 1
-    Next branch
-End Sub
-Private Function IsCommonHeader(ByVal HeaderName As String) As Boolean
-    Dim key As Variant
-    For Each key In this.CommonHeaders.Keys
-        If this.CommonHeaders(key) = HeaderName Then
-            IsCommonHeader = True
-            Exit Function
-        End If
-    Next key
-    IsCommonHeader = False
-End Function
-
-Private Sub FormatWorksheet(ByVal ws As Worksheet)
-    With ws
-        .Range(.Cells(1, 1), .Cells(1, .Columns.Count)).Font.Bold = True
-        .UsedRange.Borders.LineStyle = xlContinuous
-        .Columns.AutoFit
-        .Range("A2").Select
-        ActiveWindow.FreezePanes = True
-    End With
+    InitializeDictionaries
+    InitializeFilePatterns
+    InitializePerformanceSettings
+    ResetProcessingStats
 End Sub
 
 Private Sub Class_Terminate()
-    Set this.Headers = Nothing
-    Set this.data = Nothing
-    Set this.CommonHeaders = Nothing
+    CleanupResources
+    RestorePerformanceSettings
 End Sub
 
+' --- Public Properties ---
 
+Public Property Get ErrorLog() As String
+    ErrorLog = m_ErrorLog
+End Property
 
-Private Sub ProcessWorksheet(ByVal ws As Worksheet)
-    Dim headerInfo As THeaderInfo
-    Dim currentFilename As String
-        
-        ' Regular processing for other file types
-        headerInfo = FindHeaderInfo(ws, this.CommonHeaders)
-        
-        If headerInfo.row = 0 Then
-            Err.Raise 1001, "ProcessWorksheet", "Header row not found"
-            Exit Sub
-        End If
-        
-        With ws
-            Dim lastCol As Long, firstCol As Long, lastRow As Long
-            lastCol = .Cells(headerInfo.row, .Columns.Count).End(xlToLeft).Column
-            firstCol = .Cells(headerInfo.row, headerInfo.branchCodeCol).End(xlToLeft).Column
-            lastRow = .Cells(.Rows.Count, firstCol).End(xlUp).row
-            
-            Dim dataArray As Variant
-            dataArray = .Range(.Cells(headerInfo.row, firstCol), .Cells(lastRow, lastCol)).Value2
-            headerInfo.branchCodeCol = headerInfo.branchCodeCol - firstCol + 1
-        End With
-        
-    currentFilename = ActiveWorkbook.name
-    ' Check if this is SMEAD-001 file that needs row-to-column transformation
-    If InStr(currentFilename, "SMEAD-001") > 0 Then
-        ' Process using the row-to-column transformation
-        ProcessSMEAD1 dataArray, 1 ' Using option 1 as default
-        ' Find branch code column in transformed data
-    Dim i As Long, branchCodeCol As Long
-        For i = 1 To UBound(dataArray, 2)
-            If UCase(Trim(dataArray(1, i))) = "BRANCH CODE" Then
-                headerInfo.branchCodeCol = i
-                Exit For
-            End If
-        Next i
+Public Property Get DataDict() As Object
+    Set DataDict = m_Data
+End Property
+
+Public Property Get HasFiles() As Boolean
+    HasFiles = m_ProcessingStats.FilesProcessed > 0
+End Property
+
+Public Property Get ProcessingStats() As String
+    With m_ProcessingStats
+        ProcessingStats = "Files: " & .FilesProcessed & _
+                         ", Records: " & .RecordsProcessed & _
+                         ", Errors: " & .ErrorCount & _
+                         ", Duration: " & Format(.EndTime - .StartTime, "hh:nn:ss")
+    End With
+End Property
+
+' --- Main Public Methods ---
+
+Public Sub AddData(ByVal Key As String, ByVal Value As Variant)
+    If ValidateKey(Key) Then
+        m_Data.Add Key, Value
     End If
-
-'After Array Conversion reset the Branch Code Column Position
-ProcessData dataArray, headerInfo.branchCodeCol
-
 End Sub
-Sub ProcessSMEAD1(inputData As Variant, Optional npaOption As Integer = 1) 'DSK
-    ' Constants for column names and default values
-    Const DEFAULT_CATEGORY As String = "TOTAL_ADVANCE"
-    Const BRANCH_CODE_FORMAT As String = "000000"
-    Const OUTPUT_SHEET_NAME As String = "Business Figure "
-    
-    Dim outputData As Variant, headerRow As Variant
-    Dim categoryDict As Object, branchDict As Object, colMap As Object
-    Dim i As Long, j As Long, k As Long, rowCounter As Long, valCol As Long, colIndex As Long
-    Dim categoryArray As Variant, branchKeys As Variant, branchKey As String, categoryKey As Variant
-    Dim totalCols As Long, categoryCount As Long, valueColsCount As Long
-    Dim specificCategory As String, BranchCode As String
-    Dim branchCodeCol As Long, totNosCol As Long, totalBalCol As Long, categoryCol As Long
-    Dim zoneCol As Long, circleCol As Long, branchNameCol As Long
-    Dim requiredCols As Variant, colName As Variant
-    Dim wsNew As Worksheet
-    
-    On Error GoTo ErrorHandler
-    
-    npaOption = InputBox("How to handle NPA data?" & vbCrLf & vbCrLf & _
-                        "1 = Take from TOTAL_ADVANCE only (default)" & vbCrLf & _
-                        "2 = Take from each Category (Creates Many Columns)" & vbCrLf & _
-                        "3 = Take from a Specific Category of Your Choice", _
-                        "NPA Option", 1)
-    
-    If npaOption < 1 Or npaOption > 3 Then npaOption = 1
-    
-    ' Initialize required columns
-    requiredCols = Array("ZONE NAME", "CIRCLE NAME", "BRANCH NAME", "BRANCH CODE", "CATEGORY", "TOT NOS", "TOTAL BAL")
-    
-    ' Setup
-    Set categoryDict = CreateObject("Scripting.Dictionary")
-    Set branchDict = CreateObject("Scripting.Dictionary")
-    Set colMap = CreateObject("Scripting.Dictionary")
-    headerRow = Application.Index(inputData, 1, 0)
-    
-    ' Map columns
-    i = 1
-    For Each colName In headerRow
-        If this.LabelMaps.Exists(UCase(headerRow(i))) Then colName = this.LabelMaps(UCase(headerRow(i)))
-        colMap(UCase(Trim(colName))) = i
-        i = i + 1
-    Next colName
-    
-    ' Find required columns
-    For Each colName In requiredCols
-        If Not colMap.Exists(colName) Then
-            MsgBox "Could not find required column: " & colName, vbCritical
-            Exit Sub
-        End If
-    Next colName
 
-    ' Assign column indices
-    zoneCol = colMap("ZONE NAME")
-    circleCol = colMap("CIRCLE NAME")
-    branchNameCol = colMap("BRANCH NAME")
-    branchCodeCol = colMap("BRANCH CODE")
-    categoryCol = colMap("CATEGORY")
-    totNosCol = colMap("TOT NOS")
-    totalBalCol = colMap("TOTAL BAL")
+Public Sub LoadHeaders(ByVal LabelMap As String)
+    On Error GoTo ErrHandler
     
-    ' Count value columns (everything after total balance column)
-    valueColsCount = UBound(headerRow) - totalBalCol
+    ValidateParameter LabelMap, "LabelMap"
     
-    ' Get unique branches and categories
-    For i = 2 To UBound(inputData, 1)
-        BranchCode = inputData(i, branchCodeCol)
-        branchKey = Trim(BranchCode)
-        
-        If Len(branchKey) > 0 Then
-            If Not branchDict.Exists(branchKey) Then
-                branchDict.Add branchKey, Array( _
-                    inputData(i, zoneCol), _
-                    inputData(i, circleCol), _
-                    inputData(i, branchNameCol), _
-                    branchKey)
-            End If
-            
-            If Not categoryDict.Exists(UCase(Trim(inputData(i, categoryCol)))) Then
-                categoryDict.Add UCase(Trim(inputData(i, categoryCol))), True
-            End If
-        End If
-    Next i
-    
-    categoryCount = categoryDict.Count
-    categoryArray = categoryDict.Keys
-    
-    ' Handle option 3 (specific category)
-    If npaOption = 3 Then
-        Dim catList As String, selectedIndex As Integer
-        catList = ""
-        For i = 0 To categoryCount - 1
-            catList = catList & i + 1 & ". " & categoryArray(i) & vbCrLf
-        Next i
-        
-        selectedIndex = InputBox("Select the category number to use for NPA data:" & vbCrLf & vbCrLf & _
-                                catList, "Select Category", 1)
-                                
-        If selectedIndex < 1 Or selectedIndex > categoryCount Then
-            specificCategory = DEFAULT_CATEGORY
-        Else
-            specificCategory = categoryArray(selectedIndex - 1)
-        End If
+    ' Load common headers if not already loaded
+    If m_CommonHeaders.Count = 0 Then
+        LoadCommonHeaders
     End If
     
-    ' Calculate output size
-    Select Case npaOption
-        Case 1, 3: totalCols = 4 + (categoryCount * 2) + valueColsCount
-        Case 2: totalCols = 4 + (categoryCount * (2 + valueColsCount))
-    End Select
+    ' Load specific label mappings
+    LoadLabelMappings LabelMap
     
-    ' Create output array
-    ReDim outputData(1 To branchDict.Count + 1, 1 To totalCols)
-    
-    ' Set basic headers
-    outputData(1, 1) = "ZONE NAME"
-    outputData(1, 2) = "CIRCLE NAME"
-    outputData(1, 3) = "BRANCH NAME"
-    outputData(1, 4) = "BRANCH CODE"
-    
-    ' Set category headers
-    colIndex = 5
-    Select Case npaOption
-        Case 1: ' Default category only
-            For i = 0 To categoryCount - 1
-                outputData(1, colIndex) = categoryArray(i) & " Nos"
-                outputData(1, colIndex + 1) = categoryArray(i)
-                colIndex = colIndex + 2
-            Next i
-            
-            For i = totalBalCol + 1 To UBound(headerRow)
-                outputData(1, colIndex) = headerRow(i)
-                colIndex = colIndex + 1
-            Next i
-            
-        Case 2: ' Each category with its own NPA
-            For i = 0 To categoryCount - 1
-                outputData(1, colIndex) = categoryArray(i) & " Nos"
-                outputData(1, colIndex + 1) = categoryArray(i)
-                colIndex = colIndex + 2
-                
-                For j = totalBalCol + 1 To UBound(headerRow)
-                    outputData(1, colIndex) = categoryArray(i) & " " & headerRow(j)
-                    colIndex = colIndex + 1
-                Next j
-            Next i
-            
-        Case 3: ' Specific category
-            For i = 0 To categoryCount - 1
-                outputData(1, colIndex) = categoryArray(i) & " Nos"
-                outputData(1, colIndex + 1) = categoryArray(i)
-                colIndex = colIndex + 2
-            Next i
-            
-            For i = totalBalCol + 1 To UBound(headerRow)
-                outputData(1, colIndex) = headerRow(i) & " (from " & specificCategory & ")"
-                colIndex = colIndex + 1
-            Next i
-    End Select
-    
-    ' Fill data
-    rowCounter = 2
-    branchKeys = branchDict.Keys
-    
-    For i = 0 To branchDict.Count - 1
-        branchKey = branchKeys(i)
-        Dim branchInfo As Variant
-        branchInfo = branchDict(branchKey)
-        
-        ' Branch info
-        outputData(rowCounter, 1) = branchInfo(0) ' Zone Name
-        outputData(rowCounter, 2) = branchInfo(1) ' Circle Name
-        outputData(rowCounter, 3) = branchInfo(2) ' Branch Name
-        outputData(rowCounter, 4) = CStr(branchInfo(3)) ' Branch Code
-        
-        colIndex = 5
-        
-        Select Case npaOption
-            Case 1: ' Default category only
-                For j = 0 To categoryCount - 1
-                    categoryKey = categoryArray(j)
-                    For k = 2 To UBound(inputData, 1)
-                        If Format(inputData(k, branchCodeCol), BRANCH_CODE_FORMAT) = branchKey And _
-                           UCase(Trim(inputData(k, categoryCol))) = categoryKey Then
-                            
-                            outputData(rowCounter, colIndex) = inputData(k, totNosCol)
-                            outputData(rowCounter, colIndex + 1) = inputData(k, totalBalCol)
-                            Exit For
-                        End If
-                    Next k
-                    colIndex = colIndex + 2
-                Next j
-                
-                For k = 2 To UBound(inputData, 1)
-                    If Format(inputData(k, branchCodeCol), BRANCH_CODE_FORMAT) = branchKey And _
-                       UCase(Trim(inputData(k, categoryCol))) = UCase(DEFAULT_CATEGORY) Then
-                        
-                        For j = 1 To valueColsCount
-                            outputData(rowCounter, colIndex + j - 1) = inputData(k, totalBalCol + j)
-                        Next j
-                        Exit For
-                    End If
-                Next k
-                
-            Case 2: ' Each category with NPA
-                For j = 0 To categoryCount - 1
-                    categoryKey = categoryArray(j)
-                    For k = 2 To UBound(inputData, 1)
-                        If Format(inputData(k, branchCodeCol), BRANCH_CODE_FORMAT) = branchKey And _
-                           UCase(Trim(inputData(k, categoryCol))) = categoryKey Then
-                            
-                            outputData(rowCounter, colIndex) = inputData(k, totNosCol)
-                            outputData(rowCounter, colIndex + 1) = inputData(k, totalBalCol)
-                            
-                            For valCol = 1 To valueColsCount
-                                outputData(rowCounter, colIndex + 1 + valCol) = _
-                                    inputData(k, totalBalCol + valCol)
-                            Next valCol
-                            
-                            Exit For
-                        End If
-                    Next k
-                    colIndex = colIndex + 2 + valueColsCount
-                Next j
-                
-            Case 3: ' Specific category for NPA
-                For j = 0 To categoryCount - 1
-                    categoryKey = categoryArray(j)
-                    For k = 2 To UBound(inputData, 1)
-                        If Format(inputData(k, branchCodeCol), BRANCH_CODE_FORMAT) = branchKey And _
-                           UCase(Trim(inputData(k, categoryCol))) = categoryKey Then
-                            
-                            outputData(rowCounter, colIndex) = inputData(k, totNosCol)
-                            outputData(rowCounter, colIndex + 1) = inputData(k, totalBalCol)
-                            Exit For
-                        End If
-                    Next k
-                    colIndex = colIndex + 2
-                Next j
-                
-                For k = 2 To UBound(inputData, 1)
-                    If Format(inputData(k, branchCodeCol), BRANCH_CODE_FORMAT) = branchKey And _
-                       UCase(Trim(inputData(k, categoryCol))) = UCase(specificCategory) Then
-                        
-                        For j = 1 To valueColsCount
-                            outputData(rowCounter, colIndex + j - 1) = inputData(k, totalBalCol + j)
-                        Next j
-                        Exit For
-                    End If
-                Next k
-        End Select
-        
-        rowCounter = rowCounter + 1
-    Next i
-    Erase inputData
-    inputData = outputData
-
-    Dim msgText As String
-    Select Case npaOption
-        Case 1
-            msgText = "Data transformation complete! NPA data taken from " & DEFAULT_CATEGORY & " category."
-        Case 2
-            msgText = "Data transformation complete! NPA data included for each category."
-        Case 3
-            msgText = "Data transformation complete! NPA data taken from " & specificCategory & " category."
-    End Select
-    
-    MsgBox msgText, vbInformation
-
-
     Exit Sub
-    
-ErrorHandler:
-    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical
-    Application.ScreenUpdating = True
+ErrHandler:
+    LogError "LoadHeaders", Err.Number, Err.Description
 End Sub
 
+Public Sub ProcessFiles(ByVal FilePath As String, ByVal DateVals As Variant)
+    On Error GoTo ErrHandler
+    
+    m_ProcessingStats.StartTime = Now
+    
+    ' Validate inputs
+    ValidateProcessFilesInputs FilePath, DateVals
+    
+    ' Optimize Excel performance
+    OptimizeExcelPerformance True
+    
+    ' Initialize processing
+    InitializeProcessing
+    
+    ' Process files for each date
+    ProcessDateRange DateVals, FilePath
+    
+    ' Finalize processing
+    FinalizeProcessing
+    
+    Exit Sub
+ErrHandler:
+    LogError "ProcessFiles", Err.Number, Err.Description
+    m_ProcessingStats.ErrorCount = m_ProcessingStats.ErrorCount + 1
+Finally:
+    OptimizeExcelPerformance False
+    m_ProcessingStats.EndTime = Now
+End Sub
+
+Public Sub ClearData()
+    ClearDictionary m_Data
+    ClearDictionary m_Headers
+    Set m_ProcessedFiles = NewDict()
+    ResetProcessingStats
+End Sub
+
+' --- Private Initialization Methods ---
+
+Private Sub InitializeDictionaries()
+    Set m_Headers = NewDict()
+    Set m_Data = NewDict()
+    Set m_CommonHeaders = NewDict()
+    Set m_LabelMaps = NewDict()
+    Set m_ProcessedFiles = NewDict()
+End Sub
+
+Private Sub InitializeFilePatterns()
+    Dim patterns As Variant
+    Dim i As Long
+    
+    patterns = Split(k_config.FILE_PATTERNS, ",")
+    ReDim m_FilePatterns(LBound(patterns) To UBound(patterns))
+    
+    For i = LBound(patterns) To UBound(patterns)
+        With m_FilePatterns(i)
+            .Pattern = "*" & Trim$(patterns(i)) & "*.xlsx"
+            .LabelMap = ""
+            .Processed = False
+        End With
+    Next i
+End Sub
+
+Private Sub InitializePerformanceSettings()
+    With Application
+        m_ScreenUpdating = .ScreenUpdating
+        m_Calculation = .Calculation
+        m_EnableEvents = .EnableEvents
+    End With
+End Sub
+
+Private Sub ResetProcessingStats()
+    With m_ProcessingStats
+        .FilesProcessed = 0
+        .RecordsProcessed = 0
+        .ErrorCount = 0
+        .StartTime = 0
+        .EndTime = 0
+    End With
+End Sub
+
+' --- Private Processing Methods ---
+
+Private Sub ProcessDateRange(ByVal DateVals As Variant, ByVal FilePath As String)
+    Dim processedDates As Scripting.Dictionary
+    Set processedDates = NewDict()
+    
+    Dim dateVal As Variant
+    For Each dateVal In DateVals
+        If IsValidDate(dateVal) Then
+            Dim dateKey As String
+            dateKey = CStr(dateVal)
+            
+            If Not processedDates.Exists(dateKey) Then
+                processedDates.Add dateKey, True
+                ProcessSingleDate dateKey, FilePath
+            End If
+        End If
+    Next dateVal
+End Sub
+
+Private Sub ProcessSingleDate(ByVal DateKey As String, ByVal FilePath As String)
+    ' Try KPI file first
+    If ProcessKPIFile(DateKey) Then
+        Exit Sub
+    End If
+    
+    ' Process pattern-based files
+    ProcessPatternFiles DateKey, FilePath
+    
+    ' Calculate totals for this date
+    CalculateTotals DateKey
+End Sub
+
+Private Function ProcessKPIFile(ByVal DateKey As String) As Boolean
+    Dim kpiFile As String
+    kpiFile = k_config.FILE_KPI_PATH & DateKey & "eKPI.xlsx"
+    
+    If FileExists(kpiFile) And Not m_ProcessedFiles.Exists(kpiFile) Then
+        m_ProcessedFiles.Add kpiFile, True
+        LoadKPIFileFromWB kpiFile
+        m_ProcessingStats.FilesProcessed = m_ProcessingStats.FilesProcessed + 1
+        ProcessKPIFile = True
+    End If
+End Function
+
+Private Sub ProcessPatternFiles(ByVal DateKey As String, ByVal FilePath As String)
+    Dim i As Long
+    For i = LBound(m_FilePatterns) To UBound(m_FilePatterns)
+        ProcessPatternFile DateKey, FilePath, i
+    Next i
+End Sub
+
+Private Sub ProcessPatternFile(ByVal DateKey As String, ByVal FilePath As String, ByVal PatternIndex As Long)
+    On Error GoTo ErrHandler
+    
+    With m_FilePatterns(PatternIndex)
+        ' Load headers for this pattern
+        Dim LabelMap As String
+        LabelMap = UCase$(k_config.FILE_INFO.Cells(PatternIndex + 1, 2).Value2)
+        LoadHeaders LabelMap
+        
+        ' Find and process matching files
+        Dim filePattern As String
+        filePattern = DateKey & " " & .Pattern
+        
+        Dim fileName As String
+        fileName = Dir(FilePath & filePattern)
+        
+        Do While Len(fileName) > 0
+            Dim fileKey As String
+            fileKey = DateKey & "_" & .Pattern & "_" & fileName
+            
+            If Not m_ProcessedFiles.Exists(fileKey) Then
+                m_ProcessedFiles.Add fileKey, True
+                ProcessWorkbookFromFile FilePath & fileName, DateKey, Mid(.Pattern, 2, 9)
+                m_ProcessingStats.FilesProcessed = m_ProcessingStats.FilesProcessed + 1
+            End If
+            
+            fileName = Dir
+        Loop
+    End With
+    
+    Exit Sub
+ErrHandler:
+    LogError "ProcessPatternFile", Err.Number, Err.Description
+End Sub
+
+Private Sub LoadKPIFileFromWB(ByVal KpiFile As String)
+    On Error GoTo ErrHandler
+    
+    Dim wb As Workbook
+    Set wb = Workbooks.Open(KpiFile, ReadOnly:=True, UpdateLinks:=False)
+    
+    If WorksheetExists(wb, "KPI") Then
+        LoadKPIFile wb.Sheets("KPI").UsedRange.Value2, wb.Name
+    End If
+    
+    wb.Close SaveChanges:=False
+    
+    Exit Sub
+ErrHandler:
+    LogError "LoadKPIFileFromWB", Err.Number, Err.Description
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+End Sub
+
+Private Sub ProcessWorkbookFromFile(ByVal FullPath As String, ByVal DateKey As String, ByVal FileIde As String)
+    On Error GoTo ErrHandler
+    
+    Dim wb As Workbook
+    Set wb = Workbooks.Open(FullPath, ReadOnly:=True, UpdateLinks:=False)
+    
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If IsValidWorksheet(ws) Then
+            ProcessWorksheetData ws, DateKey
+        End If
+    Next ws
+    
+    wb.Close SaveChanges:=False
+    
+    Exit Sub
+ErrHandler:
+    LogError "ProcessWorkbookFromFile", Err.Number, Err.Description
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+End Sub
+
+Private Sub ProcessWorksheetData(ByVal ws As Worksheet, ByVal DateKey As String)
+    On Error GoTo ErrHandler
+    
+    Dim headerInfo As THeaderInfo
+    If Not GetHeaderInfo(ws, headerInfo) Then Exit Sub
+    
+    Dim dataArray As Variant
+    dataArray = GetWorksheetData(ws, headerInfo)
+    
+    If Not IsEmpty(dataArray) Then
+        ProcessDataArray dataArray, DateKey, ws.Parent.Name
+        m_ProcessingStats.RecordsProcessed = m_ProcessingStats.RecordsProcessed + UBound(dataArray, 1) - 1
+    End If
+    
+    Exit Sub
+ErrHandler:
+    LogError "ProcessWorksheetData", Err.Number, Err.Description
+End Sub
+
+Private Function GetWorksheetData(ByVal ws As Worksheet, ByVal headerInfo As THeaderInfo) As Variant
+    With ws
+        If headerInfo.LastRow > headerInfo.Row Then
+            GetWorksheetData = .Range(.Cells(headerInfo.Row, headerInfo.BranchCodeCol), _
+                                    .Cells(headerInfo.LastRow, headerInfo.LastCol)).Value2
+        End If
+    End With
+End Function
+
+Private Sub ProcessDataArray(ByRef DataArray As Variant, ByVal DateVal As String, ByVal WbName As String)
+    On Error GoTo ErrHandler
+    
+    Dim divisor As Double
+    divisor = GetDivisor(WbName)
+    
+    Dim headerIndices As Scripting.Dictionary
+    Set headerIndices = BuildKPILookup(DataArray)
+    
+    Dim branchDict As Scripting.Dictionary
+    Set branchDict = GetOrCreateBranchDict(DateVal)
+    
+    ProcessBranchData DataArray, branchDict, headerIndices, divisor
+    
+    Exit Sub
+ErrHandler:
+    LogError "ProcessDataArray", Err.Number, Err.Description
+End Sub
+
+Private Sub ProcessBranchData(ByRef DataArray As Variant, ByVal BranchDict As Scripting.Dictionary, _
+                             ByVal HeaderIndices As Scripting.Dictionary, ByVal Divisor As Double)
+    Dim i As Long, j As Long
+    Dim branchCode As String
+    Dim branchData As Scripting.Dictionary
+    
+    For i = 2 To UBound(DataArray, 1)
+        branchCode = GetNormalizedBranchCode(DataArray(i, 1))
+        
+        If IsValidBranchCode(branchCode) Then
+            Set branchData = GetOrCreateBranchData(BranchDict, branchCode)
+            ProcessBranchKPIs DataArray, i, branchData, HeaderIndices, Divisor
+        End If
+    Next i
+End Sub
+
+Private Sub ProcessBranchKPIs(ByRef DataArray As Variant, ByVal RowIndex As Long, _
+                             ByVal BranchData As Scripting.Dictionary, _
+                             ByVal HeaderIndices As Scripting.Dictionary, ByVal Divisor As Double)
+    Dim j As Long
+    Dim key As String
+    Dim value As Double
+    
+    For j = 1 To UBound(DataArray, 2)
+        If j <> 1 Then ' Skip branch code column
+            key = NormalizeHeader(DataArray(1, j))
+            
+            If IsValidKPIKey(key) Then
+                If m_LabelMaps.Exists(key) Then key = m_LabelMaps(key)
+                
+                value = GetNumericValue(Nz(DataArray(RowIndex, j), 0)) / Divisor
+                
+                If value <> 0 Then
+                    BranchData(key) = value
+                    If Not m_Headers.Exists(key) Then m_Headers.Add key, True
+                End If
+            End If
+        End If
+    Next j
+End Sub
+
+' --- Private Helper Methods ---
+
+Private Function NewDict() As Scripting.Dictionary
+    Set NewDict = New Scripting.Dictionary
+    NewDict.CompareMode = DICTIONARY_COMPARE_MODE
+End Function
+
+Private Function IsValidDate(ByVal Value As Variant) As Boolean
+    IsValidDate = Not IsEmpty(Value) And LenB(CStr(Value)) > 0
+End Function
+
+Private Function IsValidBranchCode(ByVal BranchCode As String) As Boolean
+    IsValidBranchCode = Len(BranchCode) >= MIN_BRANCH_CODE_LENGTH
+End Function
+
+Private Function IsValidKPIKey(ByVal Key As String) As Boolean
+    IsValidKPIKey = Len(Key) > 0 And Not m_CommonHeaders.Exists(Key)
+End Function
+
+Private Function IsValidWorksheet(ByVal ws As Worksheet) As Boolean
+    IsValidWorksheet = ws.Visible = xlSheetVisible And ws.UsedRange.Rows.Count > 1
+End Function
+
+Private Function GetNormalizedBranchCode(ByVal Value As Variant) As String
+    Dim normalized As String
+    normalized = NormalizeHeader(Value)
+    If Len(normalized) >= MAX_BRANCH_CODE_LENGTH Then
+        GetNormalizedBranchCode = Left$(normalized, MAX_BRANCH_CODE_LENGTH)
+    Else
+        GetNormalizedBranchCode = normalized
+    End If
+End Function
+
+Private Function GetOrCreateBranchDict(ByVal DateVal As String) As Scripting.Dictionary
+    If Not m_Data.Exists(DateVal) Then
+        Set GetOrCreateBranchDict = NewDict()
+        Set m_Data(DateVal) = GetOrCreateBranchDict
+    Else
+        Set GetOrCreateBranchDict = m_Data(DateVal)
+    End If
+End Function
+
+Private Function GetOrCreateBranchData(ByVal BranchDict As Scripting.Dictionary, _
+                                      ByVal BranchCode As String) As Scripting.Dictionary
+    If Not BranchDict.Exists(BranchCode) Then
+        Set GetOrCreateBranchData = NewDict()
+        BranchDict.Add BranchCode, GetOrCreateBranchData
+    Else
+        Set GetOrCreateBranchData = BranchDict(BranchCode)
+    End If
+End Function
+
+Private Function GetHeaderInfo(ByVal ws As Worksheet, ByRef headerInfo As THeaderInfo) As Boolean
+    On Error GoTo ErrHandler
+    
+    With ws
+        ' Find header row and branch code column
+        headerInfo.Row = FindHeaderRow(ws)
+        headerInfo.BranchCodeCol = FindBranchCodeColumn(ws, headerInfo.Row)
+        
+        If headerInfo.Row > 0 And headerInfo.BranchCodeCol > 0 Then
+            headerInfo.LastRow = .Cells(.Rows.Count, headerInfo.BranchCodeCol).End(xlUp).Row
+            headerInfo.LastCol = .Cells(headerInfo.Row, .Columns.Count).End(xlToLeft).Column
+            GetHeaderInfo = headerInfo.LastRow > headerInfo.Row
+        End If
+    End With
+    
+    Exit Function
+ErrHandler:
+    GetHeaderInfo = False
+End Function
+
+Private Function FindHeaderRow(ByVal ws As Worksheet) As Long
+    ' Implementation depends on your specific header detection logic
+    ' This is a simplified version
+    FindHeaderRow = 1
+End Function
+
+Private Function FindBranchCodeColumn(ByVal ws As Worksheet, ByVal HeaderRow As Long) As Long
+    ' Implementation depends on your specific branch code detection logic
+    ' This is a simplified version
+    FindBranchCodeColumn = 1
+End Function
+
+Private Function HasValidDataStructure(ByVal ws As Worksheet, ByRef headerInfo As THeaderInfo) As Boolean
+    HasValidDataStructure = GetHeaderInfo(ws, headerInfo)
+End Function
+
+Private Function WorksheetExists(ByVal wb As Workbook, ByVal SheetName As String) As Boolean
+    On Error GoTo ErrHandler
+    WorksheetExists = Not wb.Sheets(SheetName) Is Nothing
+    Exit Function
+ErrHandler:
+    WorksheetExists = False
+End Function
+
+Private Function FileExists(ByVal FilePath As String) As Boolean
+    FileExists = Len(Dir(FilePath)) > 0
+End Function
+
+Private Sub LoadCommonHeaders()
+    On Error GoTo ErrHandler
+    
+    Dim arr As Variant
+    arr = wsRef.Range("CommonHeaders").Value2
+    
+    Dim i As Long
+    For i = 1 To UBound(arr, 1)
+        AddIfValid m_CommonHeaders, arr(i, 1), arr(i, 2)
+    Next i
+    
+    Exit Sub
+ErrHandler:
+    LogError "LoadCommonHeaders", Err.Number, Err.Description
+End Sub
+
+Private Sub LoadLabelMappings(ByVal LabelMap As String)
+    On Error GoTo ErrHandler
+    
+    m_LabelMaps.RemoveAll
+    
+    Dim arr As Variant
+    arr = wsRef.Range(LabelMap).Value2
+    
+    Dim i As Long
+    For i = 1 To UBound(arr, 1)
+        AddIfValid m_LabelMaps, arr(i, 1), arr(i, 2)
+    Next i
+    
+    Exit Sub
+ErrHandler:
+    LogError "LoadLabelMappings", Err.Number, Err.Description
+End Sub
+
+Private Sub CalculateTotals(ByVal DateVal As String)
+    On Error GoTo ErrHandler
+    
+    If Not m_Data.Exists(DateVal) Then Exit Sub
+    
+    Dim branchDict As Scripting.Dictionary
+    Set branchDict = m_Data(DateVal)
+    
+    Dim circleDict As Scripting.Dictionary
+    Set circleDict = NewDict()
+    
+    CalculateBranchTotals branchDict, circleDict
+    
+    If circleDict.Count > 0 Then
+        Set m_Data(DateVal)("CIRCLE") = circleDict
+    End If
+    
+    Exit Sub
+ErrHandler:
+    LogError "CalculateTotals", Err.Number, Err.Description
+End Sub
+
+Private Sub CalculateBranchTotals(ByVal BranchDict As Scripting.Dictionary, _
+                                 ByVal CircleDict As Scripting.Dictionary)
+    Dim branch As Variant
+    Dim key As Variant
+    
+    For Each branch In BranchDict.Keys
+        If branch <> "CIRCLE" Then
+            Dim kpiDict As Scripting.Dictionary
+            Set kpiDict = BranchDict(branch)
+            
+            For Each key In kpiDict.Keys
+                If IsNumeric(kpiDict(key)) And key <> "BRANCH CODE" Then
+                    If Not CircleDict.Exists(key) Then CircleDict(key) = 0
+                    CircleDict(key) = CircleDict(key) + CDbl(kpiDict(key))
+                End If
+            Next key
+        End If
+    Next branch
+End Sub
+
+Private Sub LoadKPIFile(ByVal DataArray As Variant, ByVal WbName As String)
+    ' Implementation for loading KPI file data
+    ' This would be similar to ProcessDataArray but specific to KPI files
+    ProcessDataArray DataArray, ExtractDateFromFileName(WbName), WbName
+End Sub
+
+Private Function ExtractDateFromFileName(ByVal FileName As String) As String
+    ' Extract date from filename - implementation depends on your naming convention
+    ' This is a placeholder implementation
+    ExtractDateFromFileName = Format(Date, "yyyymmdd")
+End Function
+
+' --- Utility Functions ---
+
+Private Function Nz(ByVal Value As Variant, Optional ByVal DefaultValue As Variant = "") As Variant
+    If IsNull(Value) Or IsEmpty(Value) Then
+        Nz = DefaultValue
+    Else
+        Nz = Value
+    End If
+End Function
+
+Private Function NormalizeHeader(ByVal Value As Variant) As String
+    If IsEmpty(Value) Or IsNull(Value) Then
+        NormalizeHeader = ""
+    Else
+        NormalizeHeader = UCase$(Trim$(CStr(Value)))
+    End If
+End Function
+
+Private Function GetNumericValue(ByVal Value As Variant) As Double
+    If IsNumeric(Value) Then
+        GetNumericValue = CDbl(Value)
+    Else
+        Dim cleanValue As String
+        cleanValue = Replace(Trim$(Nz(Value, "")), ",", "")
+        GetNumericValue = Val(cleanValue)
+    End If
+End Function
+
+Private Function BuildKPILookup(ByRef DataArray As Variant) As Scripting.Dictionary
+    Set BuildKPILookup = NewDict()
+    
+    Dim j As Long
+    For j = 1 To UBound(DataArray, 2)
+        Dim key As String
+        key = UCase$(Nz(DataArray(1, j), ""))
+        
+        If key <> "" And Not BuildKPILookup.Exists(key) Then
+            BuildKPILookup.Add key, j
+        End If
+    Next j
+End Function
+
+Private Function GetDivisor(ByVal WbName As String) As Double
+    If InStr(WbName, "PSFID-011") > 0 Or InStr(WbName, "SMEAD-014") > 0 Then
+        GetDivisor = 100000
+    Else
+        GetDivisor = 1
+    End If
+End Function
+
+' --- Validation Methods ---
+
+Private Sub ValidateParameter(ByVal Value As Variant, ByVal ParameterName As String)
+    If IsEmpty(Value) Or IsNull(Value) Or Len(Trim$(CStr(Value))) = 0 Then
+        Err.Raise 5, MODULE_NAME, "Invalid parameter: " & ParameterName
+    End If
+End Sub
+
+Private Sub ValidateProcessFilesInputs(ByVal FilePath As String, ByVal DateVals As Variant)
+    If Not IsArray(DateVals) Or IsEmpty(DateVals) Then
+        Err.Raise 1001, MODULE_NAME, "DateVals must be a valid array"
+    End If
+    
+    If Len(Dir(FilePath, vbDirectory)) = 0 Then
+        Err.Raise 1002, MODULE_NAME, "Invalid file path: " & FilePath
+    End If
+End Sub
+
+Private Function ValidateKey(ByVal Key As String) As Boolean
+    ValidateKey = Len(Trim$(Key)) > 0 And Not m_Data.Exists(Key)
+End Function
+
+' --- Performance Optimization ---
+
+Private Sub OptimizeExcelPerformance(ByVal Enable As Boolean)
+    If Enable Then
+        With Application
+            .ScreenUpdating = False
+            .Calculation = xlCalculationManual
+            .EnableEvents = False
+        End With
+    Else
+        RestorePerformanceSettings
+    End If
+End Sub
+
+Private Sub RestorePerformanceSettings()
+    With Application
+        .ScreenUpdating = m_ScreenUpdating
+        .Calculation = m_Calculation
+        .EnableEvents = m_EnableEvents
+    End With
+End Sub
+
+' --- Cleanup Methods ---
+
+Private Sub CleanupResources()
+    ClearDictionary m_Data
+    ClearDictionary m_Headers
+    ClearDictionary m_CommonHeaders
+    ClearDictionary m_LabelMaps
+    ClearDictionary m_ProcessedFiles
+    
+    Set m_Data = Nothing
+    Set m_Headers = Nothing
+    Set m_CommonHeaders = Nothing
+    Set m_LabelMaps = Nothing
+    Set m_ProcessedFiles = Nothing
+End Sub
+
+Private Sub ClearDictionary(ByVal Dict As Scripting.Dictionary)
+    If Not Dict Is Nothing Then
+        Dict.RemoveAll
+    End If
+End Sub
+
+Private Sub AddIfValid(ByRef Dict As Scripting.Dictionary, ByVal Key As Variant, ByVal Value As Variant)
+    Dim normalizedKey As String
+    Dim normalizedValue As String
+    
+    normalizedKey = UCase$(Trim$(Nz(Key, "")))
+    normalizedValue = Trim$(Nz(Value, ""))
+    
+    If LenB(normalizedKey) > 0 And LenB(normalizedValue) > 0 And Not Dict.Exists(normalizedKey) Then
+        Dict.Add normalizedKey, normalizedValue
+    End If
+End Sub
+
+Private Sub InitializeProcessing()
+    ClearDictionary m_Data
+    ClearDictionary m_Headers
+    Set m_ProcessedFiles = NewDict()
+    ResetProcessingStats
+End Sub
+
+Private Sub FinalizeProcessing()
+    ' Any final processing steps
+    m_ProcessingStats.EndTime = Now
+End Sub
+
+' --- Error Handling ---
+
+Private Sub LogError(ByVal ProcName As String, ByVal ErrorNumber As Long, ByVal ErrorDescription As String)
+    Dim errorEntry As String
+    errorEntry = Format(Now, "yyyy-mm-dd hh:nn:ss") & " [" & MODULE_NAME & "." & ProcName & "] " & _
+                 ErrorNumber & ": " & ErrorDescription
+    
+    m_ErrorLog = m_ErrorLog & vbCrLf & errorEntry
+    m_ProcessingStats.ErrorCount = m_ProcessingStats.ErrorCount + 1
+    
+    ' Optional: Write to debug window for development
+    Debug.Print errorEntry
+End Sub
